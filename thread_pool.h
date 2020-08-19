@@ -8,12 +8,13 @@ class ThreadPool{
 	template<typename V, typename R>
 	using CDuration = const std::chrono::duration<V, R>;
 	using CTimePoint = const std::chrono::steady_clock::time_point;
-	// 执行时间，提交时间，周期时间
-	using Task_Handle = std::tuple<CTimePoint, CTimePoint, CTimePoint>;
 	using Lockgd = std::lock_guard<std::mutex>;
 	using Ulock = std::unique_lock<std::mutex>;
 
 public:
+	// 执行时间，提交时间，周期时间
+	using Task_Handle = std::tuple<CTimePoint, CTimePoint, CTimePoint>;
+
 	explicit ThreadPool(std::size_t thread_num);
 
 	~ThreadPool();
