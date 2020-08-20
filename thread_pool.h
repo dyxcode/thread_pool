@@ -13,8 +13,9 @@ class ThreadPool{
 	using Lockgd = std::lock_guard<std::mutex>;
 	using Ulock = std::unique_lock<std::mutex>;
 
+	using PeriodTask = std::pair<TimePoint, std::size_t>;
 	// 执行时间,周期时间,执行函数,句柄索引
-	using TaskType = std::tuple<TimePoint, TimePoint, std::function<void()>, std::size_t>;
+	using TaskType = std::tuple<TimePoint, std::shared_ptr<PeriodTask>, std::function<void()>, std::size_t>;
 	struct CompareTask {
 		bool operator()(const TaskType& lhs, const TaskType& rhs) {
 			return std::less<TimePoint>()(std::get<0>(lhs), std::get<0>(rhs));
@@ -35,7 +36,7 @@ public:
 	template<typename F>
 	void execute(F&& task) {
 		const TimePoint& now = std::chrono::steady_clock::now();
-		addTask<false>(std::make_tuple(now, now, std::forward<F>(task), getTaskIndex()));
+		addTask<false>(std::make_tuple(now, nullptr, std::forward<F>(task), getTaskIndex()));
 	}
 
 	// 添加一个延时任务
@@ -43,24 +44,39 @@ public:
 	std::size_t execute(F&& task, CDuration<V, R>& duration) {
 		const TimePoint& execute_time = std::chrono::steady_clock::now() + duration;
 		std::size_t task_index = getTaskIndex();
-		addTask<true>(std::make_tuple(execute_time, execute_time, std::forward<F>(task), task_index));
+		addTask<true>(std::make_tuple(execute_time, nullptr, std::forward<F>(task), task_index));
 		return task_index;
 	}
 
-	// 添加一个周期任务
+	// 添加一个定时任务
+	template<typename F, typename C>
+	std::size_t execute(F&& task, std::chrono::time_point<C> execute_time) {
+		auto duration = execute_time - C::now();
+		return execute(std::forward<F>(task), duration);
+	}
+
+	// 添加一个延时周期任务
 	template<typename F, typename V1, typename R1, typename V2, typename R2>
-	std::size_t execute(F&& task, CDuration<V1, R1>& duration, CDuration<V2, R2>& period) {
+	std::size_t execute(F&& task, CDuration<V1, R1>& duration, CDuration<V2, R2>& period, std::size_t cycle_num = 0) {
 		const TimePoint& execute_time = std::chrono::steady_clock::now() + duration;
 		const TimePoint& period_time = execute_time + period;
 		std::size_t task_index = getTaskIndex();
-		addTask<true>(std::make_tuple(execute_time, period_time, std::forward<F>(task), task_index));
+		addTask<true>(std::make_tuple(execute_time, std::make_shared<PeriodTask>(period_time, cycle_num), 
+						std::forward<F>(task), task_index));
 		return task_index;
+	}
+
+	// 添加一个定时周期任务
+	template<typename F, typename C, typename V, typename R>
+	std::size_t execute(F&& task, std::chrono::time_point<C> execute_time, CDuration<V, R>& period, std::size_t cycle_num = 0) {
+		auto duration = execute_time - typename C::now();
+		return execute(std::forward<F>(task), duration, period, cycle_num);
 	}
 
 	bool cancel(std::size_t task_index);
 
 private:
-	size_t getTaskIndex();
+	static size_t getTaskIndex();
 
 	template<bool set_index> 
 	void addTask(const TaskType& task) {

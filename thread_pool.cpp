@@ -20,15 +20,19 @@ ThreadPool::ThreadPool(std::size_t thread_num) :
 						auto task{std::move(*(this->tasks_.begin()))};
 						this->tasks_.erase(this->tasks_.begin());
 						//执行任务时解锁
-						if (std::get<0>(task) == std::get<1>(task)) { // 如果不是周期任务
+						if (std::get<1>(task) == nullptr) { // 如果不是周期任务
 							this->task_indexes_.erase(std::get<3>(task));
 							u_guard.unlock();
 						} else {
 							u_guard.unlock();
-							auto period = std::get<1>(task) - std::get<0>(task); //获取周期
-							std::get<0>(task) = std::get<1>(task);               //设置下一次执行时间
-							std::get<1>(task) = std::get<0>(task) + period;		 //设置下下次执行时间
-							this->addTask<true>(task);
+							if (std::get<1>(task)->second != 1) {
+								if (std::get<1>(task)->second)
+									--std::get<1>(task)->second;
+								auto period = std::get<1>(task)->first - std::get<0>(task); //获取周期
+								std::get<0>(task) = std::get<1>(task)->first;               //设置下一次执行时间
+								std::get<1>(task)->first = std::get<0>(task) + period;		 //设置下下次执行时间
+								this->addTask<true>(task);
+							}
 						}
 						std::get<2>(task)();
 						u_guard.lock();
