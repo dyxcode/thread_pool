@@ -1,7 +1,7 @@
 #include "thread_pool.h"
 #include <iostream>
 
-std::atomic<size_t> ThreadPool::task_num_{0};
+std::atomic<std::uint64_t> ThreadPool::task_num_{0};
 
 ThreadPool::ThreadPool(std::size_t thread_num) :
 	is_start_(true),
@@ -10,39 +10,41 @@ ThreadPool::ThreadPool(std::size_t thread_num) :
 	while (thread_num--) {
 		//事件循环，用lambda打包提交到thread中
 		threads_.emplace_back([this] {
-			//循环外加锁，不是每次都对循环内的临界区加锁，而是对非临界区解锁
-			Ulock u_guard{this->mtx_};
+			Ulock u_guard{this->mtx_};		//循环外加锁，不是每次都对循环内的临界区加锁，而是对非临界区解锁
 			while (true) {
-				if (!this->tasks_.empty()) { //任务队列非空
-					const TimePoint& now = std::chrono::steady_clock::now(); // 获取当前时间
-					const TimePoint& execute_time = std::get<0>(*(this->tasks_.cbegin())); //获取第一个任务的执行时间
-					if (now >= execute_time) {
-						auto task{std::move(*(this->tasks_.begin()))};
-						this->tasks_.erase(this->tasks_.begin());
-						//执行任务时解锁
-						if (std::get<1>(task) == nullptr) { // 如果不是周期任务
-							this->task_indexes_.erase(std::get<3>(task));
+				if (!this->is_start_) {		//线程池中止，线程退出
+					break;
+				} else if (!this->tasks_.empty()) {		//任务队列非空
+					auto&& execute_time = this->tasks_.begin()->first.base_info_.first;		// 获取第一个任务的执行时间
+					auto&& time_diff = std::visit(GetTimeDiff(), execute_time);				// 获取执行时间与当前时间的时间差
+					if (time_diff.count() <= 0) {
+						std::function<void()> task{std::move(this->tasks_.begin()->second)};
+						// 如果是周期任务，并且剩余执行次数不止一次
+						auto && period_info = this->tasks_.begin()->first.period_info_;
+						if (period_info && period_info->second != 1) {
+							// 获取任务句柄
+							TaskHandle task_handle{std::move(this->tasks_.begin()->first)};
+							this->tasks_.erase(this->tasks_.begin());
 							u_guard.unlock();
+							// 更新句柄信息
+							if (task_handle.period_info_->second)
+								--task_handle.period_info_->second;
+							std::visit(UpdatePeriodInfo(), task_handle.base_info_.first, task_handle.period_info_->first);
+							// 重新添加任务
+							this->addTask(task_handle, task);
 						} else {
+							this->tasks_.erase(this->tasks_.begin());
 							u_guard.unlock();
-							if (std::get<1>(task)->second != 1) {
-								if (std::get<1>(task)->second)
-									--std::get<1>(task)->second;
-								auto period = std::get<1>(task)->first - std::get<0>(task); //获取周期
-								std::get<0>(task) = std::get<1>(task)->first;               //设置下一次执行时间
-								std::get<1>(task)->first = std::get<0>(task) + period;		 //设置下下次执行时间
-								this->addTask<true>(task);
-							}
 						}
-						std::get<2>(task)();
+						task();
 						u_guard.lock();
 					} else if (!this->is_wait_) {
 						this->is_wait_ = true;
-						this->cv_.wait_until(u_guard, execute_time);
+						this->cv_.wait_until(u_guard, std::visit(GetTimePoint(), execute_time));
 						this->is_wait_ = false;
+					} else {
+						this->cv_.wait(u_guard);
 					}
-				} else if (!this->is_start_) { //线程池中止，线程退出
-					break;
 				} else { //等待任务队列出现任务，或者线程池中止
 					this->cv_.wait(u_guard);
 				}
@@ -62,19 +64,12 @@ ThreadPool::~ThreadPool() {
 		item.join();
 }
 
-bool ThreadPool::cancel(std::size_t task_index)
-{
+bool ThreadPool::cancel(const TaskHandle & task_handle) {
 	Lockgd guard{mtx_};
-	auto task_handle = task_indexes_.find(task_index);
-	if (task_handle != task_indexes_.end()) {
-		tasks_.erase(task_handle->second);
-		task_indexes_.erase(task_handle);
-		return true;
-	}
-	return false;
+	return tasks_.erase(task_handle);
 }
 
-size_t ThreadPool::getTaskIndex()
+std::uint64_t ThreadPool::getTaskIndex()
 {
-	return static_cast<size_t>(std::chrono::steady_clock::now().time_since_epoch().count() << 8) + (++task_num_ % (1 << 8));
+	return task_num_.fetch_add(1, std::memory_order_relaxed);
 }
