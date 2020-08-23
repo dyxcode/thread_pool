@@ -7,8 +7,6 @@
 #include <atomic>
 #include <condition_variable>
 
-#include <iostream>
-
 class ThreadPool{
 	using Lockgd = std::lock_guard<std::mutex>;
 	using Ulock = std::unique_lock<std::mutex>;
@@ -16,11 +14,13 @@ class ThreadPool{
 	using SystemClock = std::chrono::system_clock;
 	using SteadyClock = std::chrono::steady_clock;
 	using HighResClock = std::chrono::high_resolution_clock;
+	// 时间点变体，因为在VS中high_resolution_clock等于steady_clock，所以暂时注释掉
 	using TimePoint = std::variant<SystemClock::time_point, SteadyClock::time_point/*, HighResClock::time_point*/>;
 
-	template<typename R, typename P> using Duration = std::chrono::duration<R, P>;
-
+	// 周期信息（可能没有）
 	using PeriodInfo = std::pair<TimePoint, std::size_t>;
+	
+	template<typename R, typename P> using Duration = std::chrono::duration<R, P>;
 
 public:
 	class TaskHandle {
@@ -30,27 +30,18 @@ public:
 		TaskHandle(const TaskHandle&) = default;
 	private:
 		// 构造函数：传入执行时间，任务序号
-		TaskHandle(const TimePoint& execute_time, std::uint64_t task_index) :
-			data_(std::make_shared<Data>(execute_time, task_index)) { /* none */ }
-
+		TaskHandle(const TimePoint& execute_time, std::uint64_t task_index);
 		// 构造函数：额外需要周期信息
-		TaskHandle(const TimePoint& execute_time, std::uint64_t task_index, 
-					const TimePoint& period_time, std::size_t cycle_num) :
-			data_(std::make_shared<Data>(execute_time, task_index,
-					std::make_optional<PeriodInfo>(period_time, cycle_num))) { /* none */ }
+		TaskHandle(const TimePoint& execute_time, std::uint64_t task_index, const TimePoint& period_time, std::size_t cycle_num);
 
 		struct Data {
-			Data(const TimePoint& execute_time, const std::uint64_t& task_index,
-					std::optional<PeriodInfo> period_info = std::nullopt) : 
-				execute_time_(execute_time), 
-				task_index_(task_index), 
-				period_info_(std::move(period_info)) { /* none */ }
+			Data(const TimePoint& execute_time, std::uint64_t task_index, std::optional<PeriodInfo> period_info = std::nullopt);
 
 			TimePoint execute_time_;
 			std::uint64_t task_index_;
 			std::optional<PeriodInfo> period_info_; // 记录周期信息，间隔时间和执行次数
 		};
-		std::shared_ptr<Data> data_;
+		std::shared_ptr<Data> data_;	// 避免拷贝，节省空间
 	};
 
 	explicit ThreadPool(std::size_t thread_num);
@@ -100,21 +91,13 @@ public:
 		return task_handle;
 	}
 
+	// 取消任务
 	bool cancel(const TaskHandle& task_handle);
 
 private:
+	// 获取任务序号
 	static std::uint64_t getTaskNumber();
-
-	template<typename R, typename P> static 
-	TimePoint addDuration(const TimePoint& time, const Duration<R, P>& duration) {
-		TimePoint time_since_epoch;
-		if (time.index() == 0) 
-			time_since_epoch = SystemClock::time_point(std::chrono::duration_cast<SystemClock::duration>(duration));
-		else if (time.index() == 1) 
-			time_since_epoch = SteadyClock::time_point(std::chrono::duration_cast<SteadyClock::duration>(duration));
-		return std::visit(AddDuration(), time, time_since_epoch);
-	}
-
+	
 	template<typename F>
 	void addTask(TaskHandle task_handle, F&& task) {
 		std::size_t thread_index;
@@ -122,10 +105,22 @@ private:
 			Lockgd guard{mtx_};
 			std::uint64_t index = task_handle.data_->task_index_;
 			tasks_indexes_[index] = tasks_.emplace(std::move(task_handle), std::forward<F>(task));
-			if (scheduler_.empty()) return;
-			thread_index = thread_waiting_for_delay_ == threads_.size() ? scheduler_.get() : thread_waiting_for_delay_;
+			if (scheduler_.empty()) return;		// 如果当前没有等待线程，就不需要notify
+			// 如果当前有线程正在等待延时任务，则应该唤醒这个线程，否则唤醒scheduler指定的线程
+			thread_index = (thread_waiting_for_delay_ == threads_.size() ? scheduler_.get() : thread_waiting_for_delay_);
 		}
 		cvs_[thread_index].notify_one();
+	}
+
+	// 增加一段时长
+	template<typename R, typename P>
+	static TimePoint addDuration(const TimePoint& time, const Duration<R, P>& duration) {
+		TimePoint time_since_epoch;
+		if (time.index() == 0) 
+			time_since_epoch = SystemClock::time_point(std::chrono::duration_cast<SystemClock::duration>(duration));
+		else if (time.index() == 1) 
+			time_since_epoch = SteadyClock::time_point(std::chrono::duration_cast<SteadyClock::duration>(duration));
+		return std::visit(AddDuration(), time, time_since_epoch);
 	}
 
 	// 获取不同类型时间点的差值
@@ -136,12 +131,14 @@ private:
 		}
 		
 	};
+	// 增加一段时长
 	struct AddDuration {
 		template<typename T1, typename T2>
 		TimePoint operator()(const T1& lhs, const T2& rhs) const {
 			return std::chrono::time_point_cast<T1::duration>(lhs + rhs.time_since_epoch()); 
 		}
 	};
+	// 得到距离当前时间的时长
 	struct GetDuration {
 		template<typename T> std::chrono::nanoseconds operator()(const T& time_point) const { 
 			return time_point - T::clock::now();
@@ -156,6 +153,14 @@ private:
 
 	class Scheduler {
 	public:
+		// 构造函数添加等待线程的序号, 析构函数删除等待线程的序号
+		struct Guard {
+			Guard(Scheduler* scheduler, std::size_t index) : 
+				scheduler_(scheduler), index_(index) { scheduler_->put(index_); }
+			~Guard() { scheduler_->remove(index_); }
+			Scheduler* scheduler_;
+			std::size_t index_;
+		};
 		void put(std::size_t index);
 		std::size_t get();
 		void remove(std::size_t index);
