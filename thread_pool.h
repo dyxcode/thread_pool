@@ -5,8 +5,9 @@
 #include <variant>
 #include <optional>
 #include <atomic>
-#include <type_traits>
 #include <condition_variable>
+
+#include <iostream>
 
 class ThreadPool{
 	using Lockgd = std::lock_guard<std::mutex>;
@@ -19,23 +20,37 @@ class ThreadPool{
 
 	template<typename R, typename P> using Duration = std::chrono::duration<R, P>;
 
-	using BaseInfo = std::pair<TimePoint, std::uint64_t>;
 	using PeriodInfo = std::pair<TimePoint, std::size_t>;
 
 public:
 	class TaskHandle {
 		friend class ThreadPool;
+	public:
+		TaskHandle(TaskHandle&&) = default;
+		TaskHandle(const TaskHandle&) = default;
+	private:
 		// 构造函数：传入执行时间，任务序号
-		TaskHandle(BaseInfo base_info) :
-			base_info_(std::move(base_info)) { /* none */ }
+		TaskHandle(const TimePoint& execute_time, std::uint64_t task_index) :
+			data_(std::make_shared<Data>(execute_time, task_index)) { /* none */ }
 
 		// 构造函数：额外需要周期信息
-		TaskHandle(BaseInfo base_info, PeriodInfo period_info) :
-			base_info_(std::move(base_info)),
-			period_info_(std::make_optional(std::move(period_info))) { /* none */ }
+		TaskHandle(const TimePoint& execute_time, std::uint64_t task_index, 
+					const TimePoint& period_time, std::size_t cycle_num) :
+			data_(std::make_shared<Data>(execute_time, task_index,
+					std::make_optional<PeriodInfo>(period_time, cycle_num))) { /* none */ }
 
-		BaseInfo base_info_;							// 使用pair方便做比较运算
-		std::optional<PeriodInfo> period_info_;		// 记录周期信息，间隔时间和执行次数
+		struct Data {
+			Data(const TimePoint& execute_time, const std::uint64_t& task_index,
+					std::optional<PeriodInfo> period_info = std::nullopt) : 
+				execute_time_(execute_time), 
+				task_index_(task_index), 
+				period_info_(std::move(period_info)) { /* none */ }
+
+			TimePoint execute_time_;
+			std::uint64_t task_index_;
+			std::optional<PeriodInfo> period_info_; // 记录周期信息，间隔时间和执行次数
+		};
+		std::shared_ptr<Data> data_;
 	};
 
 	explicit ThreadPool(std::size_t thread_num);
@@ -49,14 +64,14 @@ public:
 	// 添加一个普通任务
 	template<typename F>
 	void execute(F&& task) {
-		const TaskHandle& task_handle{std::make_pair(SteadyClock::now(), getTaskIndex())};
-		addTask(task_handle, std::forward<F>(task));
+		TaskHandle task_handle{SteadyClock::now(), getTaskNumber()};
+		addTask(std::move(task_handle), std::forward<F>(task));
 	}
 
 	// 添加一个定时任务
 	template<typename F>
-	TaskHandle execute(F&& task, TimePoint execute_time) {
-		const TaskHandle& task_handle{std::make_pair(std::move(execute_time), getTaskIndex())};
+	TaskHandle execute(F&& task, const TimePoint& execute_time) {
+		TaskHandle task_handle{execute_time, getTaskNumber()};
 		addTask(task_handle, std::forward<F>(task));
 		return task_handle;
 	}
@@ -64,17 +79,15 @@ public:
 	// 添加一个延时任务
 	template<typename F, typename R, typename P>
 	TaskHandle execute(F&& task, const Duration<R, P>& delay) {
-		const TaskHandle& task_handle{std::make_pair(SteadyClock::now() + delay, getTaskIndex())};
+		TaskHandle task_handle{SteadyClock::now() + delay, getTaskNumber()};
 		addTask(task_handle, std::forward<F>(task));
 		return task_handle;
 	}
 
 	// 添加一个定时周期任务
 	template<typename F, typename R, typename P>
-	TaskHandle execute(F&& task, TimePoint execute_time, const Duration<R, P>& period, std::size_t cycle_num = 0) {
-		TimePoint period_time = std::visit(GetTimePoint(), execute_time) + period;
-		const TaskHandle& task_handle{std::make_pair(std::move(execute_time), getTaskIndex()),
-										std::make_pair(std::move(period_time), cycle_num)};
+	TaskHandle execute(F&& task, const TimePoint& execute_time, const Duration<R, P>& period, std::size_t cycle_num = 0) {
+		TaskHandle task_handle{execute_time, getTaskNumber(), addDuration(execute_time, period), cycle_num};
 		addTask(task_handle, std::forward<F>(task));
 		return task_handle;
 	}
@@ -82,8 +95,7 @@ public:
 	// 添加一个延时周期任务
 	template<typename F, typename R1, typename P1 , typename R2, typename P2>
 	TaskHandle execute(F&& task, const Duration<R1, P1>& delay, const Duration<R2, P2>& period, std::size_t cycle_num = 0) {
-		const TaskHandle& task_handle{std::make_pair(SteadyClock::now() + delay, getTaskIndex()),
-										std::make_pair(SteadyClock::now() + delay + period, cycle_num)};
+		TaskHandle task_handle{SteadyClock::now() + delay, getTaskNumber(), SteadyClock::now() + delay + period, cycle_num};
 		addTask(task_handle, std::forward<F>(task));
 		return task_handle;
 	}
@@ -91,53 +103,82 @@ public:
 	bool cancel(const TaskHandle& task_handle);
 
 private:
-	static std::uint64_t getTaskIndex();
+	static std::uint64_t getTaskNumber();
 
-	template<typename F>
-	void addTask(const TaskHandle& task_handle, F&& task) {
-		{
-			Lockgd guard{mtx_};
-			tasks_[task_handle] = std::forward<F>(task);
-		}
-		cv_.notify_one();
+	template<typename R, typename P> static 
+	TimePoint addDuration(const TimePoint& time, const Duration<R, P>& duration) {
+		TimePoint time_since_epoch;
+		if (time.index() == 0) 
+			time_since_epoch = SystemClock::time_point(std::chrono::duration_cast<SystemClock::duration>(duration));
+		else if (time.index() == 1) 
+			time_since_epoch = SteadyClock::time_point(std::chrono::duration_cast<SteadyClock::duration>(duration));
+		return std::visit(AddDuration(), time, time_since_epoch);
 	}
 
-	// 返回不同时钟类型下，所给时间点与当前时间的差值
-	struct GetTimeDiff {
-		template<typename T> typename T::duration operator()(const T& time) { return time - T::clock::now(); }
+	template<typename F>
+	void addTask(TaskHandle task_handle, F&& task) {
+		std::size_t thread_index;
+		{
+			Lockgd guard{mtx_};
+			std::uint64_t index = task_handle.data_->task_index_;
+			tasks_indexes_[index] = tasks_.emplace(std::move(task_handle), std::forward<F>(task));
+			if (scheduler_.empty()) return;
+			thread_index = thread_waiting_for_delay_ == threads_.size() ? scheduler_.get() : thread_waiting_for_delay_;
+		}
+		cvs_[thread_index].notify_one();
+	}
+
+	// 获取不同类型时间点的差值
+	struct CmpTimePoint {
+		template<typename T1, typename T2>
+		bool operator()(const T1& lhs, const T2& rhs) const { 
+			return lhs - T1::clock::now() < rhs - T2::clock::now();
+		}
+		
 	};
-	// 返回具体类型的时间点
-	struct GetTimePoint {
-		template<typename T> T operator()(const T& time) { return time; }
+	struct AddDuration {
+		template<typename T1, typename T2>
+		TimePoint operator()(const T1& lhs, const T2& rhs) const {
+			return std::chrono::time_point_cast<T1::duration>(lhs + rhs.time_since_epoch()); 
+		}
 	};
-	// 更新周期任务的执行时间和周期时间s
-	struct UpdatePeriodInfo {
-		template<typename T> 
-		void operator()(T& execute_time, T& period_time) {
-			auto && period = period_time - execute_time;
-			execute_time = period_time;
-			period_time = execute_time + period;
+	struct GetDuration {
+		template<typename T> std::chrono::nanoseconds operator()(const T& time_point) const { 
+			return time_point - T::clock::now();
 		}
 	};
 
 	struct TaskCmp {
-		bool operator()(const TaskHandle& lhs, const TaskHandle& rhs) {
-			// 获得执行时间与当前时间的时间间隔
-			auto&& lhs_time_diff = std::visit(GetTimeDiff(), lhs.base_info_.first);
-			auto&& rhs_time_diff = std::visit(GetTimeDiff(), rhs.base_info_.first);
-			// 如果时间间隔相等，则比较任务序号，一般而言序号越小，提交时间越早
-			if (lhs_time_diff == rhs_time_diff) return lhs.base_info_.second < rhs.base_info_.second;
-			// 否则时间间隔小的优先
-			else return lhs_time_diff < rhs_time_diff;
+		bool operator()(const TaskHandle& lhs, const TaskHandle& rhs) const {
+			return std::visit(CmpTimePoint(), lhs.data_->execute_time_, rhs.data_->execute_time_);
 		}
 	};
 
-	static std::atomic<std::uint64_t> task_num_;	// 记录任务序号，用于生成索引
+	class Scheduler {
+	public:
+		void put(std::size_t index);
+		std::size_t get();
+		void remove(std::size_t index);
+		bool empty();
+	private:
+		std::unordered_map<std::size_t, std::list<std::size_t>::iterator> index_map_; // 方便找到对应的线程结点,
+		std::list<std::size_t> waiting_thread_indexes_;								// 等待在条件变量上的线程序号
+	};
 
-	bool is_start_;							// 线程池是否开始运行
-	bool is_wait_;							// 是否有线程等待延时任务
-	std::mutex mtx_;						// 保护以下数据成员的互斥锁
-	std::condition_variable cv_;			// 条件变量
-	std::vector<std::thread> threads_;		// 线程容器
-	std::map<TaskHandle, std::function<void()>, TaskCmp> tasks_;	// 保存任务的容器
+private:
+	using TaskContainer = std::multimap<TaskHandle, std::function<void()>, TaskCmp>;
+	using TaskIndexMap = std::unordered_map<std::uint64_t, TaskContainer::iterator>;
+
+	TaskIndexMap tasks_indexes_;	// 任务索引到指向任务的迭代器
+	TaskContainer tasks_;			// 保存任务的容器
+	Scheduler scheduler_;			// 线程调度器
+
+	bool is_start_;								// 线程池是否开始运行
+	std::size_t thread_waiting_for_delay_;		// 等待延时任务线程序号
+
+	std::vector<std::condition_variable> cvs_;			// 条件变量
+	std::vector<std::thread> threads_;					// 线程容器
+	std::mutex mtx_;							// 保护数据成员的互斥锁
+
+	static std::atomic<std::uint64_t> task_num_;	// 记录任务序号，用于生成索引
 };
