@@ -33,28 +33,18 @@ struct PeriodicTask {
 	function<optional<PeriodInfo>()> f_;
 };
 
-}  // namespace detail
-
 class Scheduler {
 public:
-	// 构造函数添加等待线程的序号, 析构函数删除等待线程的序号
-	struct Guard {
-		Guard(Scheduler* scheduler, std::size_t index) : 
-			scheduler_(scheduler), index_(index) { scheduler_->put(index_); }
-		~Guard() { scheduler_->remove(index_); }
-		Scheduler* scheduler_;
-		std::size_t index_;
-	};
 	// 将等待线程的序号放入调度器中
-	void put(std::size_t index) {
+	void put(size_t index) {
 		index_map_[index] = waiting_thread_indexes_.emplace(waiting_thread_indexes_.end(), index);
 	}
 	// 从调度器中应该唤醒的线程
-	std::size_t get() {
+	size_t get() {
 		return waiting_thread_indexes_.front();
 	}
 	// 删除序号
-	void remove(std::size_t index) {
+	void remove(size_t index) {
 		waiting_thread_indexes_.erase(index_map_[index]);
 		index_map_.erase(index);
 	}
@@ -63,53 +53,21 @@ public:
 		return waiting_thread_indexes_.empty();
 	}
 private:
-	std::unordered_map<std::size_t, std::list<std::size_t>::iterator> index_map_; // 方便找到对应的线程结点,
-	std::list<std::size_t> waiting_thread_indexes_;								// 等待在条件变量上的线程序号
+	unordered_map<size_t, list<size_t>::iterator> index_map_; // 方便找到对应的线程结点,
+	list<size_t> waiting_thread_indexes_;								// 等待在条件变量上的线程序号
 };
+
+}  // namespace detail
 
 template<typename Clock>
 class ThreadPool {
-	// 周期信息（可能没有）
-	using PeriodInfo = std::pair<TimePoint, std::size_t>;
-	
-	template<typename R, typename P> using Duration = std::chrono::duration<R, P>;
-
 public:
-	explicit ThreadPool(std::size_t thread_num) 
-		: running_(true), waiting_for_delay_(thread_num), cvs_(thread_num) {
+	explicit ThreadPool(size_t thread_num) : context_(thread_num), cvs_(thread_num) {
 		while (thread_num--) {
-			threads_.emplace_back([index = thread_num, *this] {
-				unique_lock<mutex> guard{pool_mgr_.mtx_};
-				while (true) {
-					if (running) break;	//线程池中止，线程退出
-					if (tasks_.empty() || waiting_for_delay_ != cvs_.size()) {
-						ThreadPool::Scheduler::Guard index_guard{&scheduler_, thread_num};
-						cvs_[index].wait(guard);
-					} else {		//任务队列非空
-						if (tasks_.begin()->first <= Clock::now()) {					// 如果可以执行
-							auto map_node = tasks_.extract(tasks_.begin());
-							guard.unlock();
-							optional<PeriodInfo<Clock>> ret = node.value()();
-							if (!ret.has_value())
-								guard.lock();
-							else {
-								auto& [task, period, times] = ret.value();
-								map_node.key() += period;
-								map_node.value() = detail::PeriodicTask(task, period, times);
-								guard.lock();
-								tasks_.insert(map_node);
-							}
-						} else {	// 如果没有线程等待延时任务
-							ThreadPool::Scheduler::Guard index_guard{&this->scheduler_, thread_num};
-							waiting_for_delay_ = thread_num;
-							cvs_[index].wi(u_guard, std::visit(GetDuration(), execute_time));
-							waiting_for_delay_ = cvs_.size();
-						}
-					}
-				}
-			});
-
-	}
+			threads_.emplace_back([context]{
+				auto& [index, start, waiting_for_delay, mtx, tasks] = context;
+			})
+		}
 	}
 
 	~ThreadPool() {
@@ -185,6 +143,37 @@ public:
 	}
 
 private:
+	void run() {
+		unique_lock<mutex> guard{mtx_};
+		while (true) {
+			if (!start_) break;	//线程池中止，线程退出
+			if (task_mgr_.empty() || waiting_for_delay_ != thread_mgr_.size()) {
+				ThreadPool::Scheduler::Guard index_guard{&scheduler_, thread_num};
+				this->cvs_[index].wait(guard);
+			} else {		//任务队列非空
+				if (this->tasks_.begin()->first <= Clock::now()) {					// 如果可以执行
+					auto map_node = this->tasks_.extract(this->tasks_.begin());
+					guard.unlock();
+					optional<PeriodInfo<Clock>> ret = node.value()();
+					if (!ret.has_value())
+						guard.lock();
+					else {
+						auto& [task, period, times] = ret.value();
+						map_node.key() += get<1>(ret.value());
+						map_node.value() = detail::PeriodicTask(move(task), period, times);
+						guard.lock();
+						this->tasks_.insert(map_node);
+					}
+				} else {	// 如果没有线程等待延时任务
+					ThreadPool::Scheduler::Guard index_guard{&this->scheduler_, thread_num};
+					this->waiting_for_delay_ = index;
+					this->cvs_[index].wi(u_guard, std::visit(GetDuration(), execute_time));
+					this->waiting_for_delay_ = this->cvs_.size();
+				}
+			}
+		}
+	}
+
 	template<typename F>
 	void addTask(TaskHandle task_handle, F&& task) {
 		std::size_t thread_index;
@@ -200,13 +189,14 @@ private:
 	}
 
 private:
-	bool running_;								// 线程池是否开始运行
+	bool start_;								// 线程池是否开始运行
 	size_t waiting_for_delay_;		// 等待延时任务线程序号
 	mutex mtx_;							// 保护数据成员的互斥锁
-
-	vector<condition_variable> cvs_;			// 条件变量
-	vector<thread> threads_;					// 线程容器
 	multimap<typename Clock::time_point, detail::PeriodicTask<Clock>> tasks_;
+
+	vector<condition_variable> cvs_;
+	vector<thread> threads_;
+	detail::Scheduler scheduler;
 };
 
 }  // namespace std::dyx
