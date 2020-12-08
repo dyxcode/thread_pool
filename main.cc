@@ -30,12 +30,12 @@ int main()
 	dyx::ThreadPool<chrono::steady_clock> tp{2};
 	tp.execute(test_task1);
 	tp.execute(test_task2, chrono::steady_clock::now() + chrono::seconds(1));
-	auto d = tp.execute(test_task3, chrono::milliseconds(2000));
+	auto d = tp.execute(test_task3, chrono::milliseconds(2005));
+	this_thread::sleep_for(chrono::seconds(2));
 	d();
 
 	tp.execute(test_task4, chrono::steady_clock::now(), chrono::seconds(1));
 	tp.execute(test_task5, chrono::seconds(0), chrono::seconds(1), 5);
-	this_thread::sleep_for(chrono::seconds(5));
 	this_thread::sleep_for(chrono::seconds(5));
 }
 
