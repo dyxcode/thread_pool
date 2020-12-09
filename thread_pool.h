@@ -21,14 +21,17 @@ public:
   PeriodicTask(T&& task, const Period& period, int times)
     : task_(std::forward<T>(task)), period_(period), times_(times) { }
 
-  template<typename T, typename C>
-  void operator()(T&& map_node, C& container, std::mutex& mtx) {
-    if (--times_ > 0) {
-      map_node.key() += period_;
-      std::lock_guard<std::mutex> guard{mtx};
-      container.insert(std::move(map_node));
+  template<typename T, typename C, typename U>
+  void operator()(T&& map_node, C& container, U& u_lock) {
+    if (--times_ >= 0) {
+      if (times_ != 0) {
+        map_node.key() += period_;
+        container.insert(std::move(map_node));
+      }
+      u_lock.unlock();
+      task_();
+      u_lock.lock();
     }
-    if (times_ >= 0) task_();
   }
   TimePoint getEndTime(const TimePoint& execute_time) const {
     return execute_time + period_ * times_;
@@ -87,13 +90,10 @@ public:
             auto && execute_time = tasks_.begin()->first;
             if (execute_time <= Clock::now()) {
               auto map_node = tasks_.extract(tasks_.begin());
-              bool still_has_task = !tasks_.empty();
-              u_lock.unlock();
-              if (still_has_task && !scheduler_.empty())
+              if (!tasks_.empty() && !scheduler_.empty())
                 cvs_[scheduler_.get()].notify_one();
               PeriodicTask& task = map_node.mapped();
-              task(map_node, tasks_, mtx_);
-              u_lock.lock();
+              task(map_node, tasks_, u_lock);
             } else {
               scheduler_.put(index);
               waiting_for_delay_task_ = index;
